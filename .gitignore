@@ -37,3 +37,8 @@ src-tauri/gen
 *.sln
 *.sw?
 *.orig
+
+# Local planning / brainstorming artifacts
+.superpowers/
+docs/superpowers/specs/
+docs/superpowers/plans/
