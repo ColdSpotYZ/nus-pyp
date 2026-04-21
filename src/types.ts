@@ -1,11 +1,13 @@
 export type SearchField =
   | "metadata.title.en"
+  | "metadata.Faculty.en"
   | "metadata.Department.en"
   | "metadata.CourseCode.en"
   | "metadata.CourseName.en"
   | "metadata.YearOfExamination.en"
   | "metadata.AcademicLevel.en"
-  | "metadata.Semester.en";
+  | "metadata.Semester.en"
+  | "parents";
 
 export type SearchCondition = "must" | "must_not" | "should";
 
@@ -47,8 +49,25 @@ export interface ExamPaperResult {
 
 export interface SearchResponse {
   results: ExamPaperResult[];
+  totalResults?: number;
+  facets: SearchFacetGroup[];
+  searchUrl?: string;
   cursor?: string | null;
   hasMore: boolean;
+}
+
+export interface SearchFacetValue {
+  id: string;
+  label: string;
+  count: number;
+  href: string;
+  queryClauses: string[];
+}
+
+export interface SearchFacetGroup {
+  id: string;
+  title: string;
+  values: SearchFacetValue[];
 }
 
 export type DownloadJobState =

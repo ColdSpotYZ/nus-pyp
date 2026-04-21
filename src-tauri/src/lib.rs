@@ -11,11 +11,16 @@ use reqwest::header::{COOKIE, USER_AGENT};
 use reqwest::Url;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, State, Window,
+    WebviewUrl, WebviewWindowBuilder, WindowEvent,
+};
 
 const AUTH_WINDOW_LABEL: &str = "auth-window";
 const AUTH_WINDOW_URL: &str = "https://digitalgems.nus.edu.sg/browse/collection/31";
 const SEARCH_LIMIT: usize = 10;
+const MAIN_WINDOW_LABEL: &str = "main";
+const MAIN_WINDOW_STATE_FILE: &str = "main-window-state.json";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,8 +52,29 @@ struct ExamPaperResult {
 #[serde(rename_all = "camelCase")]
 struct SearchResponse {
     results: Vec<ExamPaperResult>,
+    total_results: Option<usize>,
+    facets: Vec<SearchFacetGroup>,
+    search_url: Option<String>,
     cursor: Option<String>,
     has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchFacetGroup {
+    id: String,
+    title: String,
+    values: Vec<SearchFacetValue>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchFacetValue {
+    id: String,
+    label: String,
+    count: usize,
+    href: String,
+    query_clauses: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +122,61 @@ struct AuthSessionStatus {
     ready: bool,
     current_url: String,
     message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MainWindowState {
+    user_resized: bool,
+    is_maximized: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+    x: Option<i32>,
+    y: Option<i32>,
+}
+
+fn main_window_state_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&app_data_dir).map_err(|error| error.to_string())?;
+    Ok(app_data_dir.join(MAIN_WINDOW_STATE_FILE))
+}
+
+fn load_main_window_state(app: &AppHandle) -> Result<MainWindowState, String> {
+    let path = main_window_state_path(app)?;
+    if !path.exists() {
+        return Ok(MainWindowState::default());
+    }
+
+    let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    serde_json::from_str(&contents).map_err(|error| error.to_string())
+}
+
+fn save_main_window_state(app: &AppHandle, state: &MainWindowState) -> Result<(), String> {
+    let path = main_window_state_path(app)?;
+    let contents = serde_json::to_string(state).map_err(|error| error.to_string())?;
+    fs::write(path, contents).map_err(|error| error.to_string())
+}
+
+fn persist_main_window_state(window: &Window) -> Result<(), String> {
+    let app = window.app_handle();
+    let is_maximized = window.is_maximized().map_err(|error| error.to_string())?;
+    let mut state = load_main_window_state(&app)?;
+    state.user_resized = true;
+    state.is_maximized = is_maximized;
+
+    if !is_maximized {
+        let size = window.outer_size().map_err(|error| error.to_string())?;
+        let position = window.outer_position().map_err(|error| error.to_string())?;
+        state.width = Some(size.width);
+        state.height = Some(size.height);
+        state.x = Some(position.x);
+        state.y = Some(position.y);
+    }
+
+    save_main_window_state(&app, &state)
 }
 
 fn ensure_auth_window(app: &AppHandle, visible: bool) -> Result<tauri::WebviewWindow, String> {
@@ -147,9 +228,7 @@ fn show_auth_window(app: AppHandle, url: Option<String>) -> Result<(), String> {
 
 #[tauri::command]
 fn hide_auth_window(app: AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window(AUTH_WINDOW_LABEL)
-        .ok_or_else(|| "window not found: auth-window".to_string())?;
+    let window = ensure_auth_window(&app, false)?;
     window.hide().map_err(|error| error.to_string())
 }
 
@@ -247,33 +326,50 @@ async fn validate_auth_session(
 async fn search_exam_papers(
     app: AppHandle,
     criteria: Vec<SearchCriterion>,
+    search_url: Option<String>,
+    raw_query_clauses: Option<Vec<String>>,
+    facet_clauses: Option<Vec<String>>,
     cursor: Option<String>,
 ) -> Result<SearchResponse, String> {
-    let window = app
-        .get_webview_window(AUTH_WINDOW_LABEL)
-        .ok_or_else(|| "window not found: auth-window".to_string())?;
+    let window = ensure_auth_window(&app, false)?;
 
     let collection_url: Url = AUTH_WINDOW_URL
         .parse()
         .map_err(|error| format!("invalid collection url: {error}"))?;
     let cookie_header = get_authenticated_cookie_header(&window, &collection_url)?;
 
-    let mut url = collection_url;
-    {
-        let offset = cursor
-            .as_deref()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let mut query = url.query_pairs_mut();
+    let offset = cursor
+        .as_deref()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let page = (offset / SEARCH_LIMIT) + 1;
+
+    let url = if let Some(search_url) = search_url {
+        apply_page_to_search_url(&search_url, page)?
+    } else {
+        let mut built = collection_url;
+        let mut query = built.query_pairs_mut();
         query.append_pair("limit", &SEARCH_LIMIT.to_string());
-        query.append_pair("offset", &offset.to_string());
-        query.append_pair("q", "filter,parents,equals,31");
-        for criterion in &criteria {
-            for clause in build_query_clauses(criterion)? {
+        if page > 1 {
+            query.append_pair("page", &page.to_string());
+        }
+        if let Some(raw_query_clauses) = raw_query_clauses {
+            for clause in raw_query_clauses {
                 query.append_pair("q", &clause);
             }
+        } else {
+            for clause in facet_clauses.unwrap_or_default() {
+                query.append_pair("q", &clause);
+            }
+            for criterion in &criteria {
+                for clause in build_query_clauses(criterion)? {
+                    query.append_pair("q", &clause);
+                }
+            }
         }
-    }
+        drop(query);
+        built
+    };
 
     let client = build_http_client()?;
 
@@ -305,6 +401,8 @@ async fn search_exam_papers(
         ));
     }
     let results = parse_search_results(&html, &final_url)?;
+    let facets = parse_search_facets(&html)?;
+    let total_results = extract_total_results(&facets, &html);
     if results.is_empty() && !html_explicitly_has_no_results(&html) {
         let page_title = extract_page_title(&html).unwrap_or_else(|| "Unknown page".to_string());
         return Err(format!(
@@ -316,11 +414,16 @@ async fn search_exam_papers(
         .as_deref()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
-    let has_more = results.len() == SEARCH_LIMIT;
+    let has_more = total_results
+        .map(|total| offset + results.len() < total)
+        .unwrap_or(results.len() == SEARCH_LIMIT);
     let next_cursor = has_more.then(|| (offset + SEARCH_LIMIT).to_string());
 
     Ok(SearchResponse {
         results,
+        total_results,
+        facets,
+        search_url: Some(final_url.to_string()),
         cursor: next_cursor,
         has_more,
     })
@@ -332,9 +435,7 @@ async fn start_download(
     state: State<'_, DownloadState>,
     request: DownloadRequest,
 ) -> Result<(), String> {
-    let window = app
-        .get_webview_window(AUTH_WINDOW_LABEL)
-        .ok_or_else(|| "window not found: auth-window".to_string())?;
+    let window = ensure_auth_window(&app, false)?;
 
     let view_url = Url::parse(&request.view_url).map_err(|error| error.to_string())?;
     let cookie_header = get_authenticated_cookie_header(&window, &view_url)?;
@@ -596,6 +697,10 @@ fn html_explicitly_has_no_results(html: &str) -> bool {
     normalized_html.contains("no results")
         || normalized_html.contains("no examination papers")
         || normalized_html.contains("0 results")
+        || normalized_html.contains("sorry, we couldn’t find that")
+        || normalized_html.contains("sorry, we couldn't find that")
+        || (normalized_html.contains("some troubleshooting advice")
+            && normalized_html.contains("have you spelled your search terms correctly"))
 }
 
 fn extract_page_title(html: &str) -> Option<String> {
@@ -633,7 +738,7 @@ fn get_authenticated_cookie_header(
 }
 
 fn normalize_field(field: &str) -> String {
-    if field.ends_with(".keyword") {
+    if field == "parents" || field.ends_with(".keyword") {
         field.to_string()
     } else {
         format!("{field}.keyword")
@@ -704,6 +809,152 @@ fn parse_search_results(html: &str, base_url: &Url) -> Result<Vec<ExamPaperResul
         .collect::<Vec<_>>();
 
     Ok(results)
+}
+
+fn parse_search_facets(html: &str) -> Result<Vec<SearchFacetGroup>, String> {
+    let document = Html::parse_document(html);
+    let group_selector = selector(".sidebar .card[id^='facet-']")?;
+    let title_selector = selector(".card-header")?;
+    let value_selector = selector(".list-group a[href]")?;
+    let badge_selector = selector(".badge")?;
+
+    let facets = document
+        .select(&group_selector)
+        .filter_map(|group| {
+            let id = group.value().attr("id")?.trim().to_string();
+            let title = group
+                .select(&title_selector)
+                .next()
+                .map(|node| text_content(node.text()))
+                .filter(|value| !value.is_empty())?;
+
+            let values = group
+                .select(&value_selector)
+                .filter_map(|node| {
+                    let href = node.value().attr("href")?;
+                    let count = node
+                        .select(&badge_selector)
+                        .next()
+                        .map(|badge| text_content(badge.text()))
+                        .and_then(|value| value.parse::<usize>().ok())?;
+                    let combined_text = text_content(node.text());
+                    let count_text = count.to_string();
+                    let label = combined_text
+                        .strip_prefix(&count_text)
+                        .unwrap_or(&combined_text)
+                        .trim()
+                        .to_string();
+                    let query_clauses = parse_facet_clauses_from_href(href)?;
+
+                    Some(SearchFacetValue {
+                        id: format!("{}::{}", id, normalize_label(&label)),
+                        label,
+                        count,
+                        href: if let Ok(parsed) = Url::parse(href) {
+                            parsed.to_string()
+                        } else {
+                            Url::parse(AUTH_WINDOW_URL).ok()?.join(href).ok()?.to_string()
+                        },
+                        query_clauses,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            if values.is_empty() {
+                None
+            } else {
+                Some(SearchFacetGroup { id, title, values })
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(facets)
+}
+
+fn parse_facet_clauses_from_href(href: &str) -> Option<Vec<String>> {
+    let url = if let Ok(parsed) = Url::parse(href) {
+        parsed
+    } else {
+        let base = Url::parse(AUTH_WINDOW_URL).ok()?;
+        base.join(href).ok()?
+    };
+
+    let clauses = url
+        .query_pairs()
+        .filter_map(|(key, value)| {
+            if key == "q" {
+                Some(value.into_owned())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if clauses.is_empty()
+        || clauses
+            .iter()
+            .any(|clause| clause.split(',').map(str::trim).collect::<Vec<_>>().len() < 4)
+    {
+        return None;
+    }
+
+    Some(clauses)
+}
+
+fn apply_page_to_search_url(search_url: &str, page: usize) -> Result<Url, String> {
+    let mut parsed =
+        Url::parse(search_url).map_err(|error| format!("invalid search url: {error}"))?;
+    let mut retained_pairs = parsed
+        .query_pairs()
+        .filter(|(key, _)| key != "page")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if page > 1 {
+        retained_pairs.push(("page".to_string(), page.to_string()));
+    }
+    {
+        let mut query = parsed.query_pairs_mut();
+        query.clear();
+        for (key, value) in retained_pairs {
+            query.append_pair(&key, &value);
+        }
+    }
+    Ok(parsed)
+}
+
+fn extract_total_results(facets: &[SearchFacetGroup], html: &str) -> Option<usize> {
+    facets
+        .iter()
+        .find(|group| group.id == "facet-parents")
+        .and_then(|group| group.values.first())
+        .map(|value| value.count)
+        .or_else(|| extract_total_results_from_pagination(html))
+}
+
+fn extract_total_results_from_pagination(html: &str) -> Option<usize> {
+    let document = Html::parse_document(html);
+    let current_page_selector = selector(".pagination .page-link.btn-primary-disabled").ok()?;
+    let last_page_selector = selector(".pagination .last_tag_open a[data-ci-pagination-page]").ok()?;
+    let result_selector = selector(".container-result .result, .content-result .result, .col-12.result").ok()?;
+
+    let current_page = document
+        .select(&current_page_selector)
+        .next()
+        .map(|node| text_content(node.text()))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let last_page = document
+        .select(&last_page_selector)
+        .next()
+        .and_then(|node| node.value().attr("data-ci-pagination-page"))
+        .and_then(|value| value.parse::<usize>().ok())?;
+    let current_page_result_count = document.select(&result_selector).count();
+
+    if last_page == current_page {
+        Some((last_page.saturating_sub(1) * SEARCH_LIMIT) + current_page_result_count)
+    } else {
+        Some(last_page * SEARCH_LIMIT)
+    }
 }
 
 async fn resolve_download_url(
@@ -861,6 +1112,154 @@ fn normalize_label(value: &str) -> String {
         .to_lowercase()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_page_to_search_url, extract_total_results, html_explicitly_has_no_results,
+        parse_search_facets,
+    };
+
+    #[test]
+    fn detects_digital_gems_empty_state_copy() {
+        let html = r#"
+            <div class="row">
+                <div class="col-md-12 mt-5">
+                    <h1 class="text-center direction-LTR font-weight-bold">Sorry, we couldn’t find that! ☹</h1>
+                    <h3 class="text-center">Some troubleshooting advice:</h3>
+                    <ul class="d-table mx-auto my-0">
+                        <li>Have you spelled your search terms correctly?</li>
+                    </ul>
+                </div>
+            </div>
+        "#;
+
+        assert!(html_explicitly_has_no_results(html));
+    }
+
+    #[test]
+    fn ignores_regular_browse_page_without_empty_state_markers() {
+        let html = r#"
+            <html>
+                <head><title>Digital Gems | Browse</title></head>
+                <body>
+                    <div class="container-result">
+                        <div class="search-field">Search</div>
+                    </div>
+                </body>
+            </html>
+        "#;
+
+        assert!(!html_explicitly_has_no_results(html));
+    }
+
+    #[test]
+    fn parses_facets_and_total_result_count() {
+        let html = r#"
+            <div class="sidebar">
+                <div class="card" id="facet-parents">
+                    <button class="card-header">Collections</button>
+                    <div class="list-group">
+                        <a href="https://digitalgems.nus.edu.sg/browse/collection/31?q=facet,parents,equals,31&amp;q=must,metadata.Department.en.keyword,contains,Computing&amp;limit=10">
+                            <span class="badge">353</span>
+                            Examination Papers Database
+                        </a>
+                    </div>
+                </div>
+                <div class="card" id="facet-semester">
+                    <button class="card-header">Semester</button>
+                    <div class="list-group">
+                        <a href="https://digitalgems.nus.edu.sg/browse/collection/31?q=facet,metadata.Semester.en.keyword,equals,1&amp;q=must,metadata.Department.en.keyword,contains,Computing&amp;limit=10">
+                            <span class="badge">171</span>
+                            1
+                        </a>
+                    </div>
+                </div>
+            </div>
+        "#;
+
+        let facets = parse_search_facets(html).expect("facets should parse");
+
+        assert_eq!(facets.len(), 2);
+        assert_eq!(extract_total_results(&facets, html), Some(353));
+        assert_eq!(
+            facets[1].values[0].query_clauses,
+            vec![
+                "facet,metadata.Semester.en.keyword,equals,1".to_string(),
+                "must,metadata.Department.en.keyword,contains,Computing".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_year_labels_intact_when_count_shares_digits() {
+        let html = r#"
+            <div class="sidebar">
+                <div class="card" id="facet-year-of-examination">
+                    <button class="card-header">Year of Examination</button>
+                    <div class="list-group">
+                        <a href="https://digitalgems.nus.edu.sg/browse/collection/31?q=facet,metadata.YearOfExamination.en.keyword,equals,2025%2F2026&amp;limit=10">
+                            <span class="badge">2</span>
+                            2025/2026
+                        </a>
+                        <a href="https://digitalgems.nus.edu.sg/browse/collection/31?q=facet,metadata.YearOfExamination.en.keyword,equals,2021%2F2022&amp;limit=10">
+                            <span class="badge">1</span>
+                            2021/2022
+                        </a>
+                    </div>
+                </div>
+            </div>
+        "#;
+
+        let facets = parse_search_facets(html).expect("facets should parse");
+
+        assert_eq!(facets[0].values[0].label, "2025/2026");
+        assert_eq!(facets[0].values[1].label, "2021/2022");
+    }
+
+    #[test]
+    fn parses_all_facet_clauses_from_refinement_link() {
+        let html = r#"
+            <div class="sidebar">
+                <div class="card" id="facet-year-of-examination">
+                    <button class="card-header">Year of Examination</button>
+                    <div class="list-group">
+                        <a href="https://digitalgems.nus.edu.sg/browse/collection/31?q=facet,metadata.Semester.en.keyword,equals,2&amp;q=facet,metadata.YearOfExamination.en.keyword,equals,2024%2F2025&amp;q=must,metadata.CourseCode.en.keyword,contains,CS2030&amp;limit=10">
+                            <span class="badge">1</span>
+                            2024/2025
+                        </a>
+                    </div>
+                </div>
+            </div>
+        "#;
+
+        let facets = parse_search_facets(html).expect("facets should parse");
+
+        assert_eq!(
+            facets[0].values[0].query_clauses,
+            vec![
+                "facet,metadata.Semester.en.keyword,equals,2".to_string(),
+                "facet,metadata.YearOfExamination.en.keyword,equals,2024/2025".to_string(),
+                "must,metadata.CourseCode.en.keyword,contains,CS2030".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn removes_existing_page_param_when_returning_to_first_page() {
+        let url = apply_page_to_search_url(
+            "https://digitalgems.nus.edu.sg/browse/collection/31?q=must,metadata.Department.en.keyword,contains,computing&page=2&limit=10",
+            1,
+        )
+        .expect("search url should parse");
+
+        assert_eq!(
+            url.as_str(),
+            "https://digitalgems.nus.edu.sg/browse/collection/31?q=must%2Cmetadata.Department.en.keyword%2Ccontains%2Ccomputing&limit=10"
+        );
+        assert!(url.query_pairs().all(|(key, _)| key != "page"));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -868,6 +1267,39 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let state = load_main_window_state(app.handle())?;
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                if state.user_resized {
+                    if state.is_maximized {
+                        window.maximize().map_err(|error| error.to_string())?;
+                    } else {
+                        if let (Some(width), Some(height)) = (state.width, state.height) {
+                            window
+                                .set_size(Size::Physical(PhysicalSize::new(width, height)))
+                                .map_err(|error| error.to_string())?;
+                        }
+                        if let (Some(x), Some(y)) = (state.x, state.y) {
+                            window
+                                .set_position(Position::Physical(PhysicalPosition::new(x, y)))
+                                .map_err(|error| error.to_string())?;
+                        }
+                    }
+                } else {
+                    window.maximize().map_err(|error| error.to_string())?;
+                }
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != MAIN_WINDOW_LABEL {
+                return;
+            }
+
+            if matches!(event, WindowEvent::Resized(_) | WindowEvent::Moved(_)) {
+                let _ = persist_main_window_state(window);
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             open_auth_window,
             show_auth_window,
