@@ -17,6 +17,8 @@ coverage
 
 # Rust and Tauri build output
 src-tauri/target
+src-tauri/resources/cli/*
+!src-tauri/resources/cli/.gitkeep
 
 # Generated Tauri schema output
 src-tauri/gen
@@ -39,6 +41,7 @@ src-tauri/gen
 *.orig
 
 # Local planning / brainstorming artifacts
+.codex/
 .superpowers/
 docs/superpowers/specs/
 docs/superpowers/plans/

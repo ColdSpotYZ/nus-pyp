@@ -1,0 +1,4 @@
+interface:
+  display_name: "NUS Exam Papers CLI"
+  short_description: "Drive the exam paper CLI"
+  default_prompt: "Use $nus-exam-papers-cli to authenticate, search, refine, and download exam papers through the installed local CLI."

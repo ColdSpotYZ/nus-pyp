@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "NUS examination paper search and download app"
 authors = ["Jason"]
 edition = "2021"
+default-run = "tauri-appnus-pyp"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -18,6 +19,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 scraper = "0.24"
 tauri = { version = "2", features = [] }

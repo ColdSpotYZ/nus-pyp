@@ -33,6 +33,18 @@ interface AuthSessionStatus {
   message: string;
 }
 
+interface CliToolStatus {
+  platform: string;
+  commandName: string;
+  bundled: boolean;
+  bundledPath?: string;
+  installActionAvailable: boolean;
+  installPath?: string;
+  pathManagedByInstaller: boolean;
+  inPath: boolean;
+  message: string;
+}
+
 interface SearchSnapshot {
   title: string;
   criteria: SearchCriterion[];
@@ -174,6 +186,8 @@ function App() {
     "Checking saved Digital Gems session.",
   );
   const [resultError, setResultError] = useState<string | null>(null);
+  const [cliToolStatus, setCliToolStatus] = useState<CliToolStatus | null>(null);
+  const [isInstallingCli, setIsInstallingCli] = useState(false);
   const searchTimeoutRef = useRef<number | null>(null);
   const runningJobsRef = useRef<Set<string>>(new Set());
   const downloadDestinationRef = useRef<string | null>(null);
@@ -282,6 +296,7 @@ function App() {
 
   useEffect(() => {
     void bootstrapAuthSession();
+    void refreshCliToolStatus();
 
     const unlisteners: Promise<UnlistenFn>[] = [
       listen<AppEventMap["auth:login-ready"]>("auth:login-ready", () => {
@@ -485,6 +500,29 @@ function App() {
       setResultError(formatError(error));
     } finally {
       setIsCheckingAuth(false);
+    }
+  }
+
+  async function refreshCliToolStatus() {
+    try {
+      const status = await invoke<CliToolStatus>("get_cli_tool_status");
+      setCliToolStatus(status);
+    } catch {
+      setCliToolStatus(null);
+    }
+  }
+
+  async function installCliTool() {
+    setIsInstallingCli(true);
+    try {
+      const status = await invoke<CliToolStatus>("install_cli_tool");
+      setCliToolStatus(status);
+      setResultError(null);
+      setStatusMessage(status.message);
+    } catch (error) {
+      setResultError(formatError(error));
+    } finally {
+      setIsInstallingCli(false);
     }
   }
 
@@ -1069,6 +1107,25 @@ function App() {
             </div>
             <div className="status-stack compact">
               <p className="status-copy">{statusMessage}</p>
+              {cliToolStatus ? (
+                <div className="cli-inline">
+                  <span className="cli-copy">{cliToolStatus.message}</span>
+                  {cliToolStatus.installActionAvailable ? (
+                    <button
+                      type="button"
+                      className="ghost-button compact-button"
+                      onClick={() => void installCliTool()}
+                      disabled={isInstallingCli || !cliToolStatus.bundled}
+                    >
+                      {isInstallingCli ? "Installing CLI..." : "Install CLI"}
+                    </button>
+                  ) : cliToolStatus.pathManagedByInstaller ? (
+                    <span className="metric-pill cli-pill">
+                      Command: {cliToolStatus.commandName}
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
               {resultError ? <p className="error-copy">{resultError}</p> : null}
             </div>
           </div>

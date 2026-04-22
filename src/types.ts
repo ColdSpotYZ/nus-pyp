@@ -52,8 +52,13 @@ export interface SearchResponse {
   totalResults?: number;
   facets: SearchFacetGroup[];
   searchUrl?: string;
+  rawQueryClauses?: string[];
   cursor?: string | null;
   hasMore: boolean;
+  page?: number;
+  pageSize?: number;
+  pageCount?: number;
+  sessionReady?: boolean;
 }
 
 export interface SearchFacetValue {
